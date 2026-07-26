@@ -4,6 +4,7 @@ from typing import Optional
 
 class SimulationBase(BaseModel):
     status: Optional[str] = "running"
+    mode: Optional[str] = "ai"
     end_time: Optional[datetime] = None
 
 class SimulationCreate(SimulationBase):

@@ -75,7 +75,7 @@ class SimulationRunner:
 
         # Create a Simulation record in the DB
         db_sim = await crud_simulation.create(
-            db=db, obj_in=SimulationCreate(status="running")
+            db=db, obj_in=SimulationCreate(status="running", mode=mode)
         )
         await db.commit()
         await db.refresh(db_sim)
@@ -136,21 +136,62 @@ class SimulationRunner:
         self._eplus = None
 
     # ------------------------------------------------------------------ #
+    # Background LLM decision (non-blocking)                               #
+    # ------------------------------------------------------------------ #
+    async def _run_llm_decision(self, db: AsyncSession, simulation_id: int, sensor_data: dict):
+        """
+        Called as a fire-and-forget asyncio task so it never blocks the main loop.
+        Calls Mistral, processes the decision, and broadcasts the result.
+        """
+        try:
+            decision = await llm_agent.decide(sensor_data)
+            if decision:
+                control_action = await decision_engine.process_decision(
+                    db=db,
+                    simulation_id=simulation_id,
+                    raw_decision=decision,
+                    eplus_service=self._eplus
+                )
+                if control_action:
+                    from core.websocket import manager
+                    await manager.broadcast_json({
+                        "type": "ai_decision",
+                        "action": decision.action,
+                        "setpoint": decision.setpoint,
+                        "fan_speed": decision.fan_speed,
+                        "reasoning": decision.reasoning,
+                        "confidence": decision.confidence,
+                        "applied_setpoint": control_action.setpoint,
+                        "applied_fan_speed": control_action.fan_speed,
+                        "action_applied": control_action.applied
+                    })
+        except Exception as e:
+            logger.error(f"Background LLM decision error: {e}")
+
+    # ------------------------------------------------------------------ #
     # Internal loop                                                        #
     # ------------------------------------------------------------------ #
     async def _run_loop(self, db: AsyncSession, idf_path: str, epw_path: str, mode: str):
         """
         Background loop: advances the simulation one timestep at a time,
         feeds data into the Sensor Pipeline, then yields to the event loop.
-        A placeholder hook for AI decisions is included here (Module 6+).
+        When EnergyPlus finishes (or is stopped), automatically marks the
+        simulation as 'finished' in the DB and broadcasts a completion event.
         """
+        # Throttle LLM calls so sensor data is always collected every step.
+        # Mistral is called every N steps; data pipeline runs every step.
+        LLM_CALL_EVERY_N_STEPS = 10
+        step_counter = 0
+
         # Start the EnergyPlus simulation in its own background thread
         self._eplus.start(idf_path=idf_path, epw_path=epw_path)
 
+        completed_naturally = False
         try:
             while self._running:
                 if not self._eplus or not self._eplus._running:
-                    # Simulation thread finished — wait a moment and exit
+                    # Simulation thread finished naturally
+                    completed_naturally = True
                     await asyncio.sleep(0.5)
                     break
                 if not self._paused:
@@ -158,40 +199,22 @@ class SimulationRunner:
                     sensor_data = await self._eplus.step()
 
                     if sensor_data:
-                        # Persist & broadcast via the Sensor Pipeline
+                        step_counter += 1
+
+                        # Always persist sensor data every step (fair comparison)
                         await SensorPipelineService.process_sensor_data(
                             db=db,
                             simulation_id=self._simulation_id,
                             raw_data=sensor_data,
                         )
 
-                        if mode == "ai":
-                            # --- Module 6/7: Ask LLM for a decision and process via Decision Engine ---
-                            decision = await llm_agent.decide(sensor_data)
-                            if decision:
-                                # Process the decision through the decision engine
-                                control_action = await decision_engine.process_decision(
-                                    db=db,
-                                    simulation_id=self._simulation_id,
-                                    raw_decision=decision,
-                                    eplus_service=self._eplus
-                                )
-                                
-                                if control_action:
-                                    # Broadcast the AI decision and control action via WebSocket
-                                    from core.websocket import manager
-                                    await manager.broadcast_json({
-                                        "type": "ai_decision",
-                                        "action": decision.action,
-                                        "setpoint": decision.setpoint,
-                                        "fan_speed": decision.fan_speed,
-                                        "reasoning": decision.reasoning,
-                                        "confidence": decision.confidence,
-                                        "applied_setpoint": control_action.setpoint,
-                                        "applied_fan_speed": control_action.fan_speed,
-                                        "action_applied": control_action.applied
-                                    })
-                            # ------------------------------------------------
+                        # Fire LLM call in background every N steps — never blocks the loop
+                        if mode == "ai" and step_counter % LLM_CALL_EVERY_N_STEPS == 0:
+                            sim_id_snapshot = self._simulation_id
+                            sensor_snapshot = dict(sensor_data)
+                            asyncio.create_task(
+                                self._run_llm_decision(db, sim_id_snapshot, sensor_snapshot)
+                            )
 
                 # Yield to event loop between steps; keeps the server responsive
                 await asyncio.sleep(0.1)
@@ -202,8 +225,42 @@ class SimulationRunner:
             logger.error(f"Unexpected error in simulation loop: {e}", exc_info=True)
         finally:
             self._running = False
+
+            # Auto-mark the simulation as finished in the DB
+            if self._simulation_id:
+                from datetime import datetime
+                try:
+                    status = "finished" if completed_naturally else "stopped"
+                    await crud_simulation.update(
+                        db=db,
+                        db_obj=await crud_simulation.get(db, id=self._simulation_id),
+                        obj_in=SimulationUpdate(status=status, end_time=datetime.utcnow()),
+                    )
+                    await db.commit()
+                    logger.info(f"Simulation {self._simulation_id} marked as '{status}' in DB.")
+                except Exception as db_err:
+                    logger.error(f"Failed to update simulation status: {db_err}")
+
+            # Broadcast simulation-finished event so frontend auto-refreshes
+            finished_sim_id = self._simulation_id
+            finished_mode = self._mode
+            self._simulation_id = None
+            self._eplus = None
+
+            try:
+                from core.websocket import manager
+                await manager.broadcast_json({
+                    "type": "simulation_finished",
+                    "simulation_id": finished_sim_id,
+                    "mode": finished_mode,
+                    "completed_naturally": completed_naturally,
+                })
+            except Exception:
+                pass
+
             logger.info("SimulationRunner loop exited.")
 
 
 # Module-level singleton — shared across the FastAPI application
 runner = SimulationRunner()
+

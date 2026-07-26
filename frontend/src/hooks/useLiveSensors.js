@@ -3,12 +3,18 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 const WS_URL = 'ws://127.0.0.1:8000/sensor/live';
 const MAX_DATA_POINTS = 50;
 
-export function useLiveSensors() {
+export function useLiveSensors({ onSimulationFinished } = {}) {
   const [dataHistory, setDataHistory] = useState([]);
   const [latestData, setLatestData] = useState(null);
   const [decisions, setDecisions] = useState([]);
   const [isConnected, setIsConnected] = useState(false);
   const wsRef = useRef(null);
+  const onFinishedRef = useRef(onSimulationFinished);
+
+  // Keep callback ref up to date without re-subscribing the WS
+  useEffect(() => {
+    onFinishedRef.current = onSimulationFinished;
+  }, [onSimulationFinished]);
 
   const connect = useCallback(() => {
     // Prevent multiple connections
@@ -27,7 +33,12 @@ export function useLiveSensors() {
       try {
         const payload = JSON.parse(event.data);
         
-        if (payload.type === 'ai_decision') {
+        if (payload.type === 'simulation_finished') {
+          console.log('Simulation finished:', payload);
+          if (onFinishedRef.current) {
+            onFinishedRef.current(payload);
+          }
+        } else if (payload.type === 'ai_decision') {
           setDecisions((prev) => [payload, ...prev].slice(0, 20));
         } else {
           const newDataPoint = {

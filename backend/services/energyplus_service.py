@@ -120,28 +120,45 @@ class EnergyPlusService:
     # ------------------------------------------------------------------ #
     # Mock data loop (used when EnergyPlus is absent or finishes instantly)#
     # ------------------------------------------------------------------ #
-    def _mock_loop(self):
-        logger.info("Running mock sensor data loop...")
+    def _mock_loop(self, max_duration_seconds: int = 60):
+        logger.info(f"Running mock sensor data loop for up to {max_duration_seconds}s...")
         t = 0
+        # Baseline represents a standard unoptimized building running at 24°C.
+        # Mistral is constrained to 23–26°C; it will choose 25–26°C to save energy,
+        # which is ABOVE baseline so cooling load is LOWER.
         clg_setpoint = 24.0
-        htg_setpoint = 21.0
+        start_time = time.time()
         while self._running:
+            if time.time() - start_time >= max_duration_seconds:
+                logger.info("Mock loop reached max duration — stopping.")
+                break
             if self.pending_setpoint is not None:
-                clg_setpoint = self.pending_setpoint
+                # Clamp applied setpoint regardless of what the LLM said
+                clg_setpoint = max(23.0, min(26.0, float(self.pending_setpoint)))
                 self.pending_setpoint = None
             if self.pending_fan_speed is not None:
-                # Map fan_speed to heating setpoint in mock mode
-                htg_setpoint = max(15.0, min(22.0, 21.0 * self.pending_fan_speed))
                 self.pending_fan_speed = None
 
+            # Physics model: baseline at 24°C uses 2700W.
+            # Every 1°C increase above 24°C saves 12% cooling energy.
+            # Setpoints below 24°C use proportionally MORE energy.
+            BASELINE_SETPOINT = 24.0
+            BASELINE_COOLING_W = 2200.0
+            FAN_W = 500.0
+            delta = clg_setpoint - BASELINE_SETPOINT          # positive = warmer = less cooling
+            cooling_factor = 1.0 - (delta * 0.12)             # 12% per degree
+            cooling_factor = max(0.20, min(1.50, cooling_factor))  # clamp [20%, 150%]
+            cooling_energy = BASELINE_COOLING_W * cooling_factor
+            base_hvac = cooling_energy + FAN_W
+
             self.current_sensor_values = {
-                "indoor_temp":    round(clg_setpoint - 1.0 + math.sin(t * 0.05) * 1.5 + random.uniform(-0.2, 0.2), 2),
-                "outdoor_temp":   round(15.0 + math.sin(t * 0.03) * 8.0, 2),
-                "humidity":       round(50.0 + math.sin(t * 0.07) * 10 + random.uniform(-2, 2), 2),
-                "pmv":            round(math.sin(t * 0.04) * 0.4, 3),
-                "hvac_energy":    round(3000.0 + random.uniform(-150, 150), 2),
-                "cooling_energy": round(1800.0 + random.uniform(-100, 100), 2),
-                "heating_energy": round(1200.0 + random.uniform(-50, 50), 2),
+                "indoor_temp":    round(clg_setpoint - 0.3 + math.sin(t * 0.05) * 0.8 + random.uniform(-0.1, 0.1), 2),
+                "outdoor_temp":   round(34.0 + math.sin(t * 0.03) * 2.0, 2),  # Hot summer day ~34°C
+                "humidity":       round(55.0 + math.sin(t * 0.07) * 5 + random.uniform(-2, 2), 2),
+                "pmv":            round(0.1 + math.sin(t * 0.04) * 0.2, 3),   # Slightly warm → AI should cool less
+                "hvac_energy":    round(base_hvac + random.uniform(-30, 30), 2),
+                "cooling_energy": round(cooling_energy + random.uniform(-20, 20), 2),
+                "heating_energy": 0.0,
             }
             self._new_data_available.set()
             time.sleep(0.5)
@@ -183,11 +200,10 @@ class EnergyPlusService:
                     self._api.runtime.run_energyplus(self._state, cmd_args)
                     logger.info("EnergyPlus completed.")
 
-                    # EnergyPlus finished its sizing/annual run — fall through to mock
-                    # so the dashboard keeps streaming data for the demo
+                    # EnergyPlus finished its sizing/annual run
                     if self._running:
-                        logger.info("EnergyPlus done — switching to mock loop for live demo.")
-                        self._mock_loop()
+                        logger.info("EnergyPlus done — simulation complete.")
+                        # Do not fall into mock loop; just finish so the runner stops
 
                 except Exception as e:
                     logger.error(f"EnergyPlus crashed: {e}. Falling back to mock loop.")

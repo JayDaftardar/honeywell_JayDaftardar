@@ -8,6 +8,7 @@ class Simulation(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     status = Column(String, default="running")
+    mode = Column(String, default="ai")
     start_time = Column(DateTime, default=datetime.utcnow)
     end_time = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { 
   Play, 
   Pause, 
@@ -10,7 +10,8 @@ import {
   Zap,
   Activity,
   AlertCircle,
-  Download
+  Download,
+  CheckCircle2,
 } from 'lucide-react';
 
 import { useSimulationControl } from './hooks/useSimulationControl';
@@ -29,11 +30,23 @@ export function Dashboard() {
     pauseSimulation, 
     resumeSimulation, 
     stopSimulation,
-    fetchStatus
+    fetchStatus,
+    currentMode
   } = useSimulationControl();
 
-  const { dataHistory, latestData, decisions, isConnected } = useLiveSensors();
-  const [exportStatus, setExportStatus] = useState(null); // null | 'loading' | 'success' | 'error'
+  const [completionBanner, setCompletionBanner] = useState(null); // { mode, simulation_id }
+
+  const handleSimulationFinished = useCallback((payload) => {
+    // Auto-refresh status so buttons update immediately
+    fetchStatus();
+    // Show a completion banner for 5 seconds
+    setCompletionBanner({ mode: payload.mode, id: payload.simulation_id });
+    setTimeout(() => setCompletionBanner(null), 6000);
+  }, [fetchStatus]);
+
+  const { dataHistory, latestData, decisions, isConnected } = useLiveSensors({ onSimulationFinished: handleSimulationFinished });
+  const [exportStatus, setExportStatus] = useState(null);
+  const [resetStatus, setResetStatus] = useState(null);
 
   const exportModifiedIdf = async () => {
     setExportStatus('loading');
@@ -53,6 +66,25 @@ export function Dashboard() {
     }
   };
 
+  const resetAllData = async () => {
+    if (!window.confirm('⚠️ This will DELETE all simulation data from the database. Are you sure you want to start fresh?')) return;
+    setResetStatus('loading');
+    try {
+      const res = await fetch('http://127.0.0.1:8000/simulation/reset-data', { method: 'POST' });
+      if (res.ok) {
+        setResetStatus('success');
+        setTimeout(() => setResetStatus(null), 4000);
+        fetchStatus();
+      } else {
+        setResetStatus('error');
+        setTimeout(() => setResetStatus(null), 4000);
+      }
+    } catch (e) {
+      setResetStatus('error');
+      setTimeout(() => setResetStatus(null), 4000);
+    }
+  };
+
   useEffect(() => {
     fetchStatus();
     // Poll status occasionally to stay in sync if multiple clients exist
@@ -62,6 +94,19 @@ export function Dashboard() {
 
   return (
     <div className="min-h-full p-4 md:p-6 lg:p-8 flex flex-col gap-6">
+
+      {/* COMPLETION BANNER */}
+      {completionBanner && (
+        <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 animate-in fade-in slide-in-from-top-2 duration-300">
+          <CheckCircle2 size={18} className="text-emerald-400 flex-shrink-0" />
+          <span className="font-medium">
+            {completionBanner.mode === 'baseline'
+              ? '✓ Baseline run complete! Data saved. Now click "Start AI Run" to compare.'
+              : '✓ AI run complete! Data saved. Head to Analytics to see the full comparison.'}
+          </span>
+        </div>
+      )}
+
       {/* HEADER */}
       <header className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
@@ -75,6 +120,7 @@ export function Dashboard() {
             </span>
             <span className="flex items-center gap-1.5 text-slate-400 font-medium bg-slate-900/50 px-3 py-1 rounded-full border border-slate-800 uppercase tracking-wider text-xs">
               Status: <span className="text-slate-200">{status}</span>
+              {currentMode && <span className="text-emerald-400 ml-1">({currentMode})</span>}
             </span>
           </div>
         </div>
@@ -88,9 +134,14 @@ export function Dashboard() {
           )}
           
           {(status === 'stopped' || status === 'finished') && (
-            <Button variant="primary" icon={Play} onClick={startSimulation} isLoading={loading}>
-              Start Autonomous Loop
-            </Button>
+            <>
+              <Button variant="secondary" icon={Play} onClick={() => startSimulation('baseline')} isLoading={loading}>
+                Start Baseline Run
+              </Button>
+              <Button variant="primary" icon={Play} onClick={() => startSimulation('ai')} isLoading={loading}>
+                Start AI Run
+              </Button>
+            </>
           )}
           
           {status === 'running' && (

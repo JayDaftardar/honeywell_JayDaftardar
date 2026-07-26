@@ -8,11 +8,11 @@ export function useSimulationControl() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  const startSimulation = useCallback(async () => {
+  const startSimulation = useCallback(async (mode = "ai") => {
     setLoading(true);
     setError(null);
     try {
-      await axios.post(`${API_BASE_URL}/simulation/start`);
+      await axios.post(`${API_BASE_URL}/simulation/start?mode=${mode}`);
       setStatus('running');
     } catch (err) {
       setError(err.response?.data?.detail || err.message);
@@ -60,13 +60,17 @@ export function useSimulationControl() {
     }
   }, []);
   
+  const [currentMode, setCurrentMode] = useState(null);
+
   const fetchStatus = useCallback(async () => {
     try {
       const response = await axios.get(`${API_BASE_URL}/simulation/status`);
       if (response.data.running) {
         setStatus(response.data.paused ? 'paused' : 'running');
+        setCurrentMode(response.data.mode);
       } else {
         setStatus('stopped');
+        setCurrentMode(null);
       }
     } catch (err) {
       console.error("Failed to fetch status", err);
@@ -77,6 +81,7 @@ export function useSimulationControl() {
     status,
     loading,
     error,
+    currentMode,
     startSimulation,
     pauseSimulation,
     resumeSimulation,
